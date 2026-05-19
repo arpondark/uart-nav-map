@@ -95,8 +95,9 @@ class HQStitcher(threading.Thread):
         self.new_since_last = 0
 
     def _create_hq_stitcher(self):
+        stitch_mode = getattr(cv2, "Stitcher_SCANS", None)
         try:
-            stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
+            stitcher = cv2.Stitcher_create(stitch_mode) if stitch_mode is not None else cv2.Stitcher_create()
         except AttributeError:
             stitcher = cv2.Stitcher_create()
 
@@ -105,7 +106,7 @@ class HQStitcher(threading.Thread):
             ("setSeamEstimationResol", -1),
             ("setCompositingResol", -1),
             ("setPanoConfidenceThresh", 0.35),
-            ("setWaveCorrection", True),
+            ("setWaveCorrection", False),
         ):
             method = getattr(stitcher, method_name, None)
             if method is not None:

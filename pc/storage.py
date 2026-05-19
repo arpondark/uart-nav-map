@@ -76,7 +76,14 @@ def save_frame(image_bytes: bytes, metadata: dict) -> StoredFrame:
 
 def list_images(limit: Optional[int] = None) -> List[Path]:
     ensure_directories()
-    images = sorted(config.IMAGE_DIR.glob("img_*.jpg"), key=lambda path: path.stat().st_mtime)
+    images = sorted(
+        [
+            path
+            for path in config.IMAGE_DIR.iterdir()
+            if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png"}
+        ],
+        key=lambda path: path.stat().st_mtime,
+    )
     if limit is not None:
         return images[-limit:]
     return images

@@ -58,8 +58,9 @@ class RealtimeStitcher(threading.Thread):
             cv2.imwrite(str(self.output_path), images[0])
             return
 
+        stitch_mode = getattr(cv2, "Stitcher_SCANS", None)
         try:
-            stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
+            stitcher = cv2.Stitcher_create(stitch_mode) if stitch_mode is not None else cv2.Stitcher_create()
         except AttributeError:
             stitcher = cv2.Stitcher_create()
 
