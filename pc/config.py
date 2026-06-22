@@ -28,3 +28,12 @@ VIEWER_ENABLED = os.getenv("VIEWER_ENABLED", "1").lower() not in {"0", "false", 
 VIEWER_REFRESH_MS = int(os.getenv("VIEWER_REFRESH_MS", "100"))
 
 QUEUE_MAX_SIZE = int(os.getenv("QUEUE_MAX_SIZE", "200"))
+
+# Dashboard / local capture defaults.
+DASHBOARD_HOST = os.getenv("DASHBOARD_HOST", "0.0.0.0")
+DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "5000"))
+CAPTURE_INTERVAL_SECONDS = float(os.getenv("CAPTURE_INTERVAL_SECONDS", "1.0"))
+CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
+CAMERA_WIDTH = int(os.getenv("CAMERA_WIDTH", "1280"))
+CAMERA_HEIGHT = int(os.getenv("CAMERA_HEIGHT", "720"))
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "85"))
