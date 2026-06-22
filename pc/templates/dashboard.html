@@ -11,49 +11,83 @@
     <h1>UART Nav Map</h1>
     <div class="status-strip">
       <span class="dot" id="dot-capture"></span><span id="capture-text">Capture: idle</span>
-      <span class="dot" id="dot-stitch"></span><span id="stitch-text">Stitch: idle</span>
-      <span class="meta" id="meta-text">frames=0 buffer=0</span>
+      <span class="dot" id="dot-realtime"></span><span id="realtime-text">Realtime: idle</span>
+      <span class="dot" id="dot-hq"></span><span id="hq-text">HQ: idle</span>
+      <span class="meta" id="meta-text">frames=0 rt=N/A hq=N/A</span>
     </div>
   </header>
 
   <main class="grid">
     <section class="panel">
-      <h2>Controls</h2>
+      <h2>Capture</h2>
       <div class="button-row">
         <button id="btn-capture" class="btn primary">Start Capture</button>
-        <button id="btn-stitch" class="btn accent">Stitch Now</button>
-        <button id="btn-stop-stitch" class="btn ghost">Stop Stitch</button>
+        <button id="btn-capture-stop" class="btn ghost">Stop Capture</button>
       </div>
       <p class="hint">
-        Click <b>Start Capture</b> to begin grabbing frames from the camera.
-        Click <b>Stitch Now</b> to enable real-time stitching &mdash; every new
-        frame is folded into the live map automatically.
+        Local PC camera for development. In production the Jetson
+        (<code>jetson/run.py</code>) is the capture source &mdash; its frames
+        arrive at <code>/upload</code> and are auto-stitched when a stitch
+        mode is on.
       </p>
       <ul class="status-list">
         <li><span>Capture running</span><b id="status-capture">No</b></li>
         <li><span>Frames captured</span><b id="status-frames">0</b></li>
         <li><span>Capture FPS</span><b id="status-fps">0.00</b></li>
         <li><span>Last frame</span><b id="status-last">none</b></li>
-        <li><span>Stitcher state</span><b id="status-stitcher">idle</b></li>
-        <li><span>Stitch buffer</span><b id="status-buffer">0</b></li>
-        <li><span>Last stitch (ms)</span><b id="status-stitch-ms">&mdash;</b></li>
+        <li><span>Image dir</span><b id="status-image-dir">&mdash;</b></li>
+      </ul>
+    </section>
+
+    <section class="panel">
+      <h2>Stitch Modes</h2>
+      <div class="button-grid">
+        <button id="btn-stitch-realtime" class="btn accent">Stitch Realtime</button>
+        <button id="btn-stitch-hq" class="btn primary">Stitch HQ</button>
+        <button id="btn-stitch-all" class="btn primary strong">Stitch All</button>
+        <button id="btn-stitch-stop" class="btn ghost">Stop All</button>
+      </div>
+      <p class="hint">
+        <b>Realtime</b>: fast low-res preview, every new frame updates the
+        live map instantly.<br/>
+        <b>HQ</b>: high-quality batch stitch, runs every
+        <code id="status-hq-batch">&hellip;</code> frames or every
+        <code id="status-hq-period">&hellip;</code> seconds.<br/>
+        <b>All</b>: starts both at once.
+      </p>
+      <ul class="status-list">
+        <li><span>Realtime state</span><b id="status-stitcher">idle</b></li>
+        <li><span>Realtime buffer</span><b id="status-buffer">0</b></li>
+        <li><span>Last realtime (ms)</span><b id="status-stitch-ms">&mdash;</b></li>
+        <li><span>HQ state</span><b id="status-hq-state">idle</b></li>
+        <li><span>HQ batch size</span><b id="status-hq-buffer">0</b></li>
+        <li><span>Last HQ (ms)</span><b id="status-hq-ms">&mdash;</b></li>
+        <li><span>HQ CUDA</span><b id="status-hq-cuda">n/a</b></li>
       </ul>
       <div id="error-box" class="error hidden"></div>
     </section>
 
     <section class="panel">
-      <h2>Live Stitched Map</h2>
+      <h2>Realtime Map</h2>
       <div class="image-wrap">
         <img id="map-img" alt="Realtime stitched map" />
-        <div id="map-empty" class="overlay-text">No stitched map yet</div>
+        <div id="map-empty" class="overlay-text">No realtime map yet</div>
       </div>
     </section>
 
     <section class="panel">
-      <h2>Latest Captured Frame</h2>
+      <h2>HQ Map</h2>
+      <div class="image-wrap">
+        <img id="hq-img" alt="HQ stitched map" />
+        <div id="hq-empty" class="overlay-text">No HQ map yet</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Latest Frame</h2>
       <div class="image-wrap">
         <img id="frame-img" alt="Latest frame" />
-        <div id="frame-empty" class="overlay-text">No frame captured</div>
+        <div id="frame-empty" class="overlay-text">No frame received</div>
       </div>
     </section>
   </main>

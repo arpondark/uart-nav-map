@@ -1,60 +1,64 @@
 # Drone Dual Map System
 
-Two-process pipeline: the Jetson grabs frames from an IP camera over RTSP
-and uploads them to the PC, where the stitcher runs and a web dashboard
-lets the operator start real-time stitching.
+Two-process pipeline with a single web dashboard that exposes every
+stitch mode as a button.
 
-* **Jetson**: `python jetson/run.py`
-  opens `rtsp://192.168.144.25:8554/main.264`, saves every frame to
+* **Jetson** runs `jetson/run.py` — opens the IP camera at
+  `rtsp://192.168.144.25:8554/main.264`, saves every frame locally to
   `data/jetson_images/`, and POSTs it to the PC.
-* **PC**: `python stitch.py`
-  hosts the dashboard on `http://0.0.0.0:5000`. The operator clicks
-  **Stitch Now** to start real-time stitching; every new upload is folded
-  into the live map automatically.
+* **PC** runs `pc/run.py` — hosts the web dashboard on
+  `http://0.0.0.0:5000`. The operator clicks **Stitch Realtime**,
+  **Stitch HQ**, or **Stitch All**; every new upload is folded into
+  the appropriate map automatically.
 
-GPS capture is disabled for now. See `CHANGES.md` for the full update log
-and instructions for re-enabling it.
+GPS capture is disabled for now. See `CHANGES.md` for the full update
+log and instructions for re-enabling it.
+
+## What to run
+
+* To get the web dashboard on the PC: `python pc/run.py`
+  (or `python stitch.py` — same thing).
+* To start the Jetson sender: `python jetson/run.py`
+
+That's all. No other scripts to run.
 
 ## Quick start
 
-On the PC (the receiver):
-
 ```bash
+# PC (the receiver / dashboard)
 pip install -r requirements.txt
-python stitch.py
-```
+python pc/run.py
 
-Open the printed URL in any browser. The dashboard has:
-
-* **Start Capture** – begin capturing from a local camera attached to
-  the PC (development mode only; the Jetson is the canonical capture
-  source).
-* **Stitch Now** – enable real-time stitching. Every new frame the
-  Jetson uploads is folded into the live map automatically.
-* **Stop Stitch** – freeze the live map.
-
-On the Jetson (the sender):
-
-```bash
+# Jetson (the sender)
 pip install -r requirements.txt
 PC_UPLOAD_URL="http://<PC_IP>:5000/upload" python jetson/run.py
 ```
 
-The script connects to the RTSP camera, saves a local copy of every
-frame to `data/jetson_images/`, and uploads it to the PC.
+Open the printed dashboard URL in any browser.
 
-`stitch_now.py` is also kept for one-shot batch stitching of images
-that are already on disk on the PC.
+## Dashboard buttons
+
+| Button              | What it does                                                   |
+| ------------------- | -------------------------------------------------------------- |
+| Start / Stop Capture | Local PC camera (development only)                             |
+| **Stitch Realtime** | Fast low-res preview, every new frame updates the live map     |
+| **Stitch HQ**       | High-quality batch, runs every N frames or T seconds           |
+| **Stitch All**      | Starts both Realtime and HQ                                    |
+| Stop All            | Stops whichever stitch modes are running                       |
+
+The dashboard also shows three previews: **Latest Frame**, **Realtime
+Map**, **HQ Map**, plus the buffer size, last stitch time, FPS, and HQ
+CUDA availability.
 
 ## Architecture
 
 ```
 +-------------------+        HTTP /upload         +------------------+
-|  Jetson (run.py)  | --------------------------> |  PC (stitch.py)  |
+|  Jetson (run.py)  | --------------------------> |  PC (run.py)     |
 |                   |                             |                  |
 |  - RTSP camera    |                             |  - dashboard     |
-|  - local save     |  http://<pc-ip>:5000/upload |  - stitcher      |
-|  - HTTP uploader  |                             |  - /api/*        |
+|  - local save     |  http://<pc-ip>:5000/upload |  - realtime      |
+|  - HTTP uploader  |                             |  - HQ stitcher   |
 +-------------------+                             +------------------+
 ```
 
@@ -92,35 +96,38 @@ that are already on disk on the PC.
 | `CAPTURE_INTERVAL_SECONDS` | `1.0`        | Time between local frames              |
 | `REALTIME_BUFFER_SIZE`     | `8`          | Rolling window for the live map        |
 | `REALTIME_RESIZE_WIDTH`    | `640`        | Downscale width for the live map       |
+| `HQ_BATCH_SIZE`            | `25`         | Frames between HQ re-stitches          |
+| `HQ_TRIGGER_SECONDS`       | `60.0`       | Max age between HQ re-stitches         |
+| `HQ_MIN_IMAGES`            | `8`          | Minimum frames before HQ starts        |
+| `HQ_MAX_IMAGES`            | `50`         | Maximum window size for HQ             |
 
 ## Structure
 
 ```text
-stitch.py                        # PC launcher
-jetson/
-  run.py                         # Jetson: RTSP + upload
-  rtsp_camera.py                 # Jetson: RTSP wrapper
-  config.py                      # Jetson-side tunables
-  capture_send.py                # legacy uploader (GPS commented)
-  gps_reader.py                  # legacy GPS reader (unused)
-  camera.py                      # legacy CSI / V4L2 wrapper (unused)
-pc/
-  dashboard_server.py            # Flask app, REST endpoints
-  capture_controller.py          # capture + stitch controllers
-  templates/dashboard.html       # web UI
-  static/dashboard.{css,js}      # web UI assets
-  storage.py                     # image/metadata IO
-  realtime_stitcher.py           # fast OpenCV stitcher
-  hq_stitcher.py                 # batch high-quality stitcher
-  config.py                      # PC-side tunables
+pc/                                # everything the PC needs
+  run.py                           # single entry point
+  dashboard_server.py              # Flask app + REST endpoints
+  capture_controller.py            # CaptureController, StitchController, HQController
+  realtime_stitcher.py             # fast OpenCV stitcher
+  hq_stitcher.py                   # batch HQ stitcher
+  storage.py                       # image/metadata IO
+  config.py                        # PC-side tunables
+  templates/dashboard.html         # web UI
+  static/dashboard.{css,js}        # web UI assets
+jetson/                            # everything the Jetson needs
+  run.py                           # single entry point
+  rtsp_camera.py                   # RTSP wrapper
+  config.py                        # Jetson-side tunables
+stitch.py                          # top-level alias for pc/run.py
 data/
-  images/                        # frames saved by /upload
-  metadata/                      # per-frame JSON metadata
+  images/                          # frames saved by /upload
+  metadata/                        # per-frame JSON metadata
   stitched/
-    realtime_map.jpg             # live map
-    hq_map.jpg                   # high-quality map
-  jetson_images/                 # local mirror of Jetson captures
-CHANGES.md                       # full changelog
+    realtime_map.jpg               # output of Stitch Realtime
+    hq_map.jpg                     # output of Stitch HQ
+  jetson_images/                   # local mirror of the Jetson captures
+README.md
+CHANGES.md                         # full changelog
 ```
 
 ## HTTP API
@@ -128,13 +135,18 @@ CHANGES.md                       # full changelog
 | Method | Path                 | Purpose                                |
 | ------ | -------------------- | -------------------------------------- |
 | GET    | `/`                  | Dashboard HTML page                    |
-| GET    | `/api/status`        | Combined capture + stitch status       |
+| GET    | `/api/status`        | Combined capture + realtime + HQ state |
 | POST   | `/api/capture/start` | Begin local camera capture             |
 | POST   | `/api/capture/stop`  | Stop local camera capture              |
-| POST   | `/api/stitch/start`  | Enable real-time stitching             |
-| POST   | `/api/stitch/stop`   | Disable real-time stitching            |
+| POST   | `/api/stitch/start`  | Enable realtime stitching              |
+| POST   | `/api/stitch/stop`   | Disable realtime stitching             |
+| POST   | `/api/hq/start`      | Enable HQ stitching                    |
+| POST   | `/api/hq/stop`       | Disable HQ stitching                   |
+| POST   | `/api/all/start`     | Enable realtime + HQ                   |
+| POST   | `/api/all/stop`      | Disable realtime + HQ                  |
 | GET    | `/api/frame`         | Stream a captured image (`?path=...`)  |
 | GET    | `/maps/realtime`     | Latest realtime stitched map           |
+| GET    | `/maps/hq`           | Latest HQ stitched map                 |
 | GET    | `/health`            | Liveness probe                         |
 | POST   | `/upload`            | External sender (form-data image + metadata JSON) |
 
@@ -150,4 +162,4 @@ For reliable stitching:
 
 ## Re-enabling GPS
 
-See `CHANGES.md` for the exact lines to uncomment.
+See `CHANGES.md` for the exact lines to add.

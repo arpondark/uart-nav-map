@@ -90,11 +90,22 @@ html, body {
   color: var(--text);
 }
 
-.button-row {
+.button-row,
+.button-grid {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 12px;
+}
+
+.button-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+}
+
+.button-grid .btn {
+  flex: none;
+  width: 100%;
 }
 
 .btn {
@@ -116,6 +127,8 @@ html, body {
 
 .btn.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
 .btn.primary:hover { background: var(--primary-strong); }
+.btn.primary.strong { background: #5e3edb; border-color: #5e3edb; }
+.btn.primary.strong:hover { background: #7c5cf0; }
 .btn.accent { background: var(--accent); border-color: var(--accent); color: #fff; }
 .btn.accent:hover { background: var(--accent-strong); }
 .btn.ghost { background: transparent; }

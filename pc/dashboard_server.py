@@ -1,22 +1,26 @@
-"""Flask dashboard server: receives frames and runs the realtime stitcher.
+"""Flask dashboard server: receives frames, runs realtime + HQ stitching.
 
-This is the entry point used by ``stitch.py`` on the PC. The PC does **not**
-capture frames itself; the Jetson (``jetson/run.py``) pushes frames to the
-``/upload`` endpoint. Each upload is persisted to ``data/images`` and, when
-the operator has clicked **Stitch Now**, fed into the realtime stitcher so
-the live map is updated immediately.
+The dashboard exposes every stitch mode as a button:
 
-A separate ``/api/capture/start`` toggle is still exposed for development on
-the PC: it captures from a local camera (USB, built-in webcam, etc.) and
-streams the frames into the same pipeline. The Jetson deployment doesn't
-use it.
+* **Start / Stop Capture** – start the local camera (development mode
+  only; the Jetson is the canonical capture source in production).
+* **Stitch Realtime** – enable the fast low-resolution stitcher. Every
+  new uploaded frame is folded into the live map immediately.
+* **Stitch HQ** – enable the high-quality batch stitcher. Frames are
+  collected into a window and a full OpenCV stitch runs every
+  ``HQ_BATCH_SIZE`` frames or every ``HQ_TRIGGER_SECONDS``.
+* **Stitch All** – start both modes at once.
+* **Stitch Stop** – stop whichever modes are running.
+
+``/upload`` accepts frames from the Jetson (``jetson/run.py``). Each
+upload is persisted to ``data/images`` and forwarded to whichever
+stitchers are enabled.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import queue
 import signal
 import sys
 from pathlib import Path
@@ -29,26 +33,16 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from pc import config
-from pc.capture_controller import CaptureController, StitchController, attach
-from pc.storage import StoredFrame, ensure_directories, save_frame
+from pc.capture_controller import (
+    CaptureController,
+    HQController,
+    StitchController,
+    attach,
+    attach_hq,
+)
+from pc.storage import ensure_directories, save_frame
 
 log = logging.getLogger("pc.dashboard")
-
-
-def _put_latest(target_queue: "queue.Queue[StoredFrame]", frame: StoredFrame) -> None:
-    try:
-        target_queue.put_nowait(frame)
-        return
-    except queue.Full:
-        pass
-    try:
-        target_queue.get_nowait()
-    except queue.Empty:
-        pass
-    try:
-        target_queue.put_nowait(frame)
-    except queue.Full:
-        pass
 
 
 def parse_metadata(raw: Optional[str]) -> Dict[str, Any]:
@@ -69,6 +63,7 @@ def parse_metadata(raw: Optional[str]) -> Dict[str, Any]:
 def create_app(
     capture: CaptureController,
     stitch: StitchController,
+    hq: HQController,
 ) -> Flask:
     app = Flask(
         __name__,
@@ -89,7 +84,10 @@ def create_app(
             {
                 "capture": capture.status(),
                 "stitch": stitch.status(),
+                "hq": hq.status(),
                 "image_dir": str(config.IMAGE_DIR),
+                "realtime_map": str(config.REALTIME_MAP_PATH),
+                "hq_map": str(config.HQ_MAP_PATH),
             }
         )
 
@@ -113,6 +111,44 @@ def create_app(
         result = stitch.stitch_stop()
         return jsonify({"ok": True, **result, **stitch.status()})
 
+    @app.post("/api/hq/start")
+    def hq_start():
+        result = hq.start()
+        return jsonify({"ok": True, **result})
+
+    @app.post("/api/hq/stop")
+    def hq_stop():
+        result = hq.stop()
+        return jsonify({"ok": True, **result})
+
+    @app.post("/api/all/start")
+    def all_start():
+        stitch_result = stitch.stitch_now()
+        hq_result = hq.start()
+        return jsonify(
+            {
+                "ok": True,
+                "stitch": stitch_result,
+                "hq": hq_result,
+                "stitch_status": stitch.status(),
+                "hq_status": hq.status(),
+            }
+        )
+
+    @app.post("/api/all/stop")
+    def all_stop():
+        stitch_result = stitch.stitch_stop()
+        hq_result = hq.stop()
+        return jsonify(
+            {
+                "ok": True,
+                "stitch": stitch_result,
+                "hq": hq_result,
+                "stitch_status": stitch.status(),
+                "hq_status": hq.status(),
+            }
+        )
+
     @app.get("/api/frame")
     def api_frame():
         path = request.args.get("path")
@@ -132,6 +168,12 @@ def create_app(
             return jsonify({"ok": False, "error": "realtime map not ready"}), 404
         return send_file(config.REALTIME_MAP_PATH, mimetype="image/jpeg")
 
+    @app.get("/maps/hq")
+    def hq_map():
+        if not config.HQ_MAP_PATH.exists():
+            return jsonify({"ok": False, "error": "HQ map not ready"}), 404
+        return send_file(config.HQ_MAP_PATH, mimetype="image/jpeg")
+
     @app.get("/health")
     def health():
         return jsonify(
@@ -139,13 +181,12 @@ def create_app(
                 "ok": True,
                 "capture": capture.status(),
                 "stitch": stitch.status(),
+                "hq": hq.status(),
             }
         )
 
     # ---------------------------------------------------------------
     # /upload — Jetson (or any external sender) drops frames here.
-    # Each upload is persisted to data/images and, when the operator
-    # has enabled real-time stitching, fed into the stitcher.
     # ---------------------------------------------------------------
     @app.post("/upload")
     def upload():
@@ -160,15 +201,12 @@ def create_app(
 
             frame = save_frame(image_bytes, metadata)
 
-            # Update capture controller's "last image" so the dashboard
-            # shows the most recent upload even when no local camera is
-            # attached.
             capture.record_remote_frame(frame)
 
-            # If the operator enabled Stitch Now, fold the new frame
-            # into the live map immediately.
             if stitch.is_enabled():
                 stitch.on_frame(frame)
+            if hq.is_enabled():
+                hq.on_frame(frame)
 
             return jsonify({"ok": True, "frame": frame.to_dict()})
         except Exception as exc:
@@ -188,9 +226,11 @@ def main() -> int:
 
     capture = CaptureController()
     stitch = StitchController()
+    hq = HQController()
     attach(capture, stitch)
+    attach_hq(capture, hq)
 
-    app = create_app(capture, stitch)
+    app = create_app(capture, stitch, hq)
 
     stop_requested = False
 
@@ -199,6 +239,7 @@ def main() -> int:
         stop_requested = True
         capture.stop()
         stitch.stop()
+        hq.shutdown()
 
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
@@ -208,12 +249,14 @@ def main() -> int:
     log.info("Dashboard listening on http://%s:%s", host, port)
     log.info("Image dir:     %s", config.IMAGE_DIR)
     log.info("Realtime map:  %s", config.REALTIME_MAP_PATH)
+    log.info("HQ map:        %s", config.HQ_MAP_PATH)
 
     try:
         app.run(host=host, port=port, threaded=True, use_reloader=False)
     finally:
         capture.stop()
         stitch.stop()
+        hq.shutdown()
 
     return 0 if not stop_requested else 130
 

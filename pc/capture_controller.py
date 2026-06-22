@@ -7,6 +7,10 @@ This module owns:
   - StitchController: holds the realtime stitcher thread. The stitcher is idle
     until ``stitch_now()`` is called; from then on every new frame triggers a
     realtime re-stitch so the live map always includes the newest image.
+  - HQController: drives the high-quality batch stitcher. When enabled it
+    ingests every new frame into the HQ buffer and triggers a heavy
+    re-stitch periodically (every N frames or every T seconds) so the
+    high-quality map is always converging on the latest batch.
 """
 
 from __future__ import annotations
@@ -20,12 +24,26 @@ import cv2
 
 try:
     from pc import config
+    from pc.hq_stitcher import HQStitcher
     from pc.realtime_stitcher import RealtimeStitcher
-    from pc.storage import StoredFrame, ensure_directories, save_frame
+    from pc.storage import (
+        StoredFrame,
+        ensure_directories,
+        existing_image_strings,
+        paths_that_exist,
+        save_frame,
+    )
 except ImportError:  # Allow running from inside the pc/ directory.
     import config  # type: ignore
+    from hq_stitcher import HQStitcher  # type: ignore
     from realtime_stitcher import RealtimeStitcher  # type: ignore
-    from storage import StoredFrame, ensure_directories, save_frame  # type: ignore
+    from storage import (  # type: ignore
+        StoredFrame,
+        ensure_directories,
+        existing_image_strings,
+        paths_that_exist,
+        save_frame,
+    )
 
 
 class CaptureController:
@@ -50,6 +68,8 @@ class CaptureController:
         self._fps = 0.0
         # Bound by ``attach`` to forward frames to the stitch controller.
         self._on_frame = None
+        # Bound by ``attach_hq`` to forward frames to the HQ stitcher.
+        self._on_hq_frame = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -107,25 +127,12 @@ class CaptureController:
     # ------------------------------------------------------------------
     @staticmethod
     def _load_camera_class():
-        """Return the ``Camera`` class from pc/, jetson/, or fall back to a
-        tiny built-in wrapper that uses OpenCV's VideoCapture directly.
+        """Return a ``Camera`` class for local PC capture (development only).
 
-        The ``jetson`` package isn't always importable on the PC, so we try
-        the obvious paths in order before giving up.
+        The PC's local capture path uses a tiny built-in OpenCV wrapper that
+        opens ``cv2.VideoCapture(index)`` directly. In production the Jetson
+        (``jetson/run.py``) is the canonical capture source.
         """
-
-        for module_path in (
-            "pc.camera",
-            "jetson.camera",
-            "camera",
-        ):
-            try:
-                module = __import__(module_path, fromlist=["Camera"])
-                Camera = getattr(module, "Camera", None)
-                if Camera is not None:
-                    return Camera
-            except Exception:
-                continue
 
         class _BuiltinCamera:
             def __init__(self, index: int = 0) -> None:
@@ -206,6 +213,13 @@ class CaptureController:
                     except Exception as exc:  # pragma: no cover - listener errors.
                         with self._status_lock:
                             self._last_error = f"Frame listener error: {exc}"
+
+                if self._on_hq_frame is not None:
+                    try:
+                        self._on_hq_frame(frame)
+                    except Exception as exc:
+                        with self._status_lock:
+                            self._last_error = f"HQ listener error: {exc}"
             except Exception as exc:
                 with self._status_lock:
                     self._last_error = f"Capture error: {exc}"
@@ -380,3 +394,215 @@ def attach(capture: CaptureController, stitch: StitchController) -> None:
     """Wire the capture controller to forward frames to the stitcher."""
 
     capture._on_frame = stitch.on_frame
+
+
+def attach_hq(capture: CaptureController, hq: "HQController") -> None:
+    """Wire the capture controller to forward frames to the HQ stitcher."""
+
+    capture._on_hq_frame = hq.on_frame
+
+
+class HQController:
+    """High-quality batch stitcher driver.
+
+    Until ``start()`` is called, the HQ worker is dormant. Once enabled it
+    ingests every new frame into its image batch and periodically runs a
+    full OpenCV stitcher over the latest window. The heavy work is
+    offloaded to a background thread so the HTTP request that triggered
+    the start returns immediately.
+    """
+
+    def __init__(
+        self,
+        batch_size: int = config.HQ_BATCH_SIZE,
+        min_images: int = config.HQ_MIN_IMAGES,
+        max_images: int = config.HQ_MAX_IMAGES,
+        trigger_seconds: float = config.HQ_TRIGGER_SECONDS,
+        output_path: Path = config.HQ_MAP_PATH,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._enabled = False
+        self._batch_size = batch_size
+        self._min_images = min_images
+        self._max_images = max_images
+        self._trigger_seconds = trigger_seconds
+        self.output_path = Path(output_path)
+        self._image_paths: list[str] = existing_image_strings(limit=max_images)
+        self._new_since_last = 0
+        self._last_attempt = 0.0
+        self._last_status = "idle"
+        self._last_stitch_ms: Optional[float] = None
+        self._last_stitch_at: Optional[float] = None
+        self._last_image_count = 0
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._stitch_lock = threading.Lock()  # serialises _stitch_latest_batch
+        self._cuda_available = self._check_cuda()
+
+    # ------------------------------------------------------------------
+    # Status
+    # ------------------------------------------------------------------
+    def status(self) -> dict:
+        with self._lock:
+            return {
+                "enabled": self._enabled,
+                "last_status": self._last_status,
+                "last_stitch_ms": self._last_stitch_ms,
+                "last_stitch_at": self._last_stitch_at,
+                "buffer_size": len(self._image_paths),
+                "new_since_last": self._new_since_last,
+                "last_image_count": self._last_image_count,
+                "hq_map_exists": self.output_path.exists(),
+                "cuda_available": self._cuda_available,
+                "batch_size": self._batch_size,
+                "trigger_seconds": self._trigger_seconds,
+            }
+
+    def is_enabled(self) -> bool:
+        with self._lock:
+            return self._enabled
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+    def start(self) -> dict:
+        """Enable the HQ stitcher and trigger an initial run if possible."""
+
+        with self._lock:
+            if self._enabled:
+                return {"ok": True, "already_running": True, **self.status()}
+            self._enabled = True
+            self._last_status = "starting"
+            self._new_since_last = 0
+            self._last_attempt = time.monotonic()
+
+        if self._thread is None or not self._thread.is_alive():
+            self._stop_event.clear()
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+        # Run the first stitch in the background; return immediately.
+        threading.Thread(target=self._stitch_latest_batch, daemon=True).start()
+        return {"ok": True, **self.status()}
+
+    def stop(self) -> dict:
+        with self._lock:
+            self._enabled = False
+            self._last_status = "stopped"
+        return {"ok": True, **self.status()}
+
+    def shutdown(self) -> None:
+        with self._lock:
+            self._enabled = False
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+
+    # ------------------------------------------------------------------
+    # Frame ingest
+    # ------------------------------------------------------------------
+    def on_frame(self, frame: StoredFrame) -> None:
+        with self._lock:
+            if frame.image_path not in self._image_paths and Path(frame.image_path).exists():
+                self._image_paths.append(frame.image_path)
+                self._image_paths = paths_that_exist(self._image_paths)[-self._max_images :]
+                self._new_since_last += 1
+
+    # ------------------------------------------------------------------
+    # Background worker
+    # ------------------------------------------------------------------
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            now = time.monotonic()
+            time_due = now - self._last_attempt >= self._trigger_seconds
+            batch_due = False
+            with self._lock:
+                batch_due = self._new_since_last >= self._batch_size
+                count = len(self._image_paths)
+                if self._enabled and count >= self._min_images and (batch_due or time_due):
+                    self._last_attempt = now
+                    self._new_since_last = 0
+                    should_stitch = True
+                else:
+                    should_stitch = False
+
+            if should_stitch:
+                self._stitch_latest_batch()
+            self._stop_event.wait(0.5)
+
+    def _stitch_latest_batch(self) -> None:
+        with self._stitch_lock:
+            started = time.monotonic()
+            with self._lock:
+                batch_paths = paths_that_exist(self._image_paths)[-self._max_images :]
+
+            if len(batch_paths) < self._min_images:
+                with self._lock:
+                    self._last_status = "empty"
+                return
+
+            images = []
+            for path in batch_paths:
+                image = cv2.imread(path)
+                if image is not None:
+                    images.append(image)
+
+            if len(images) < self._min_images:
+                with self._lock:
+                    self._last_status = "empty"
+                return
+
+            stitcher = self._create_stitcher()
+            try:
+                status, stitched = stitcher.stitch(images)
+            except cv2.error as exc:
+                with self._lock:
+                    self._last_status = f"error: {exc}"
+                return
+
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            with self._lock:
+                self._last_stitch_ms = elapsed_ms
+                self._last_stitch_at = time.time()
+                self._last_image_count = len(images)
+
+            if status == cv2.Stitcher_OK and stitched is not None:
+                self.output_path.parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(
+                    str(self.output_path), stitched, [int(cv2.IMWRITE_JPEG_QUALITY), 95]
+                )
+                with self._lock:
+                    self._last_status = "running"
+            else:
+                with self._lock:
+                    self._last_status = f"skipped ({status})"
+
+    def _create_stitcher(self):
+        stitch_mode = getattr(cv2, "Stitcher_SCANS", None)
+        try:
+            stitcher = cv2.Stitcher_create(stitch_mode) if stitch_mode is not None else cv2.Stitcher_create()
+        except AttributeError:
+            stitcher = cv2.Stitcher_create()
+
+        for method_name, value in (
+            ("setRegistrationResol", -1),
+            ("setSeamEstimationResol", -1),
+            ("setCompositingResol", -1),
+            ("setPanoConfidenceThresh", 0.35),
+            ("setWaveCorrection", False),
+        ):
+            method = getattr(stitcher, method_name, None)
+            if method is not None:
+                try:
+                    method(value)
+                except Exception:
+                    pass
+        return stitcher
+
+    @staticmethod
+    def _check_cuda() -> bool:
+        try:
+            return hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0
+        except Exception:
+            return False

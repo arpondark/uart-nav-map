@@ -1,36 +1,11 @@
-"""PC-side launcher: opens the web dashboard for the stitcher.
+"""PC-side launcher (top-level alias for ``pc/run.py``).
 
-Usage:
-
-    python stitch.py
-
-The PC does **not** capture frames itself. The Jetson (running
-``jetson/run.py``) opens the RTSP camera and POSTs each frame to
-``/upload`` on this server. As soon as the operator clicks
-**Stitch Now** in the dashboard, every new upload is folded into the
-live stitched map automatically.
-
-By default the dashboard listens on http://0.0.0.0:5000/. Override with
-``DASHBOARD_HOST`` and ``DASHBOARD_PORT``.
+The single script to run on the PC is ``pc/run.py``. This file is kept
+as a convenience so existing commands (``python stitch.py``) continue
+to work; it just delegates to ``pc/run.py``.
 """
 
-from __future__ import annotations
-
-import sys
-from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-
-def main() -> int:
-    try:
-        from pc.dashboard_server import main as dashboard_main
-    except Exception as exc:
-        print(f"Failed to import dashboard server: {exc}")
-        return 1
-    return dashboard_main()
+from pc.run import main
 
 
 if __name__ == "__main__":
